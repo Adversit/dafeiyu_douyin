@@ -1,0 +1,22 @@
+{
+  "name": "dafeiyu-douyin-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manually scoped Douyin comment agent adapted from douyin-cli and nekowhale-stickers",
+  "engines": { "node": ">=20.12" },
+  "scripts": {
+    "init": "node src/cli.js init",
+    "bridge": "node src/cli.js bridge",
+    "doctor": "node src/cli.js doctor",
+    "inspect": "node src/cli.js inspect",
+    "once": "node src/cli.js run --once",
+    "start": "node src/cli.js run",
+    "status": "node src/cli.js status",
+    "check": "node scripts/check.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "11.10.0",
+    "dsh-nekowhale-stickers": "1.1.1"
+  }
+}

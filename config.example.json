@@ -1,0 +1,33 @@
+{
+  "accountUid": "",
+  "videos": [],
+  "bridge": {
+    "host": "127.0.0.1",
+    "port": 19422,
+    "token": "",
+    "requestTimeout": 30000
+  },
+  "douyin": {
+    "inboundSchemaConfirmed": false,
+    "maxPages": 50,
+    "maxReplyPages": 50
+  },
+  "model": {
+    "provider": "deepseek",
+    "model": "",
+    "timeoutMs": 30000
+  },
+  "worker": {
+    "pollIntervalMs": 60000,
+    "sendIntervalMs": 60000,
+    "maxRepliesPerRound": 3,
+    "maxCandidatesPerRound": 30
+  },
+  "stickers": {
+    "enabled": false,
+    "mode": "optional",
+    "limit": 5,
+    "autoSync": "lazy",
+    "allowedMimeTypes": ["image/png", "image/jpeg", "image/webp", "image/gif"]
+  }
+}
