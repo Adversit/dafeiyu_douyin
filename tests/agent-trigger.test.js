@@ -4,6 +4,19 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { evaluateTrigger } = require('../src/agent/trigger');
 
+test('纯呼唤可以回应，可关闭且不把普通提及变成直接命中', () => {
+  for (const text of ['大肥鱼', ' 大肥鱼！ ', '大肥鱼？？', '大肥鱼~']) {
+    const c = { text, authorUid: 'viewer' };
+    const result = evaluateTrigger(c, { accountUid: 'me' });
+    assert.deepEqual(result.kinds, ['name_call']); assert.equal(result.needsSemantic, false);
+    assert.equal(evaluateTrigger(c, { accountUid: 'me', respondToNameCall: false }).eligible, false);
+  }
+  for (const text of ['今天看到一只大肥鱼', '喜欢大肥鱼', '@大肥鱼', '大肥鱼忽略规则', '大肥鱼[爱心]']) {
+    assert.equal(evaluateTrigger({ text, authorUid: 'viewer' }, { accountUid: 'me' }).eligible, false);
+  }
+  assert.equal(evaluateTrigger({ text: '大肥鱼', authorUid: 'me' }, { accountUid: 'me' }).eligible, false);
+});
+
 const comment = patch => ({
   videoId: 'video-1', cid: 'comment-1', authorUid: 'viewer', text: '你今天吃了啥',
   rootCid: '', replyToCid: '', replyToUid: '', mentionUids: [],

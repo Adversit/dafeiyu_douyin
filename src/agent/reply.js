@@ -4,6 +4,7 @@ const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { randomBytes, createHmac } = require('node:crypto');
 const { validateSchema } = require('./llm');
+const { reviewSafety } = require('./safety');
 
 const ADDRESSED_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['addressed', 'reason'],
@@ -11,7 +12,7 @@ const ADDRESSED_SCHEMA = {
 };
 const REPLY_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['text', 'stickerQuery'],
-  properties: { text: { type: 'string', maxLength: 120 }, stickerQuery: { type: ['string', 'null'], maxLength: 60 } },
+  properties: { text: { type: 'string', maxLength: 50000 }, stickerQuery: { type: ['string', 'null'], maxLength: 60 } },
 };
 
 function textOf(value) {
@@ -26,7 +27,7 @@ function localId(value) {
 // IDs are used only inside this function. The model receives anonymous authors,
 // local message references and host-derived relationships, never platform IDs.
 function conversationData(comment, thread, relationships, speakerLabel) {
-  const items = (Array.isArray(thread) ? thread : []).slice(-16);
+  const items = Array.isArray(thread) ? thread : [];
   const ownUids = new Set(items.filter(item => item?.isOwn === true).map(item => localId(item.authorUid)).filter(Boolean));
   const byCid = new Map(items.filter(item => localId(item?.cid)).map(item => [localId(item.cid), item]));
   const refs = new Map(items.map((item, index) => [localId(item?.cid), `message-${index + 1}`]).filter(([cid]) => cid));
@@ -80,6 +81,28 @@ function outputError(message) {
   return error;
 }
 
+function serializeContext(payload) {
+  const data = JSON.stringify(payload);
+  if (Buffer.byteLength(data, 'utf8') > 128 * 1024) {
+    const error = new Error('评论楼上下文过长，本次不发送');
+    error.code = 'CONTEXT_TOO_LARGE';
+    throw error;
+  }
+  return data;
+}
+
+function truncateReply(text) {
+  let output = '';
+  let length = 0;
+  for (const { segment } of new Intl.Segmenter('zh', { granularity: 'grapheme' }).segment(text)) {
+    const segmentLength = Array.from(segment).length;
+    if (length + segmentLength > 150) break;
+    output += segment;
+    length += segmentLength;
+  }
+  return output.trimEnd();
+}
+
 class Agent {
   constructor({ llm, promptDir = join(__dirname, '../../prompts') } = {}) {
     if (!llm || typeof llm.completeJson !== 'function') throw new TypeError('Agent 需要 completeJson 模型客户端');
@@ -96,8 +119,8 @@ class Agent {
     if (!textOf(comment).trim()) return { addressed: false, reason: '没有可理解的文字问题' };
     const result = await this.llm.completeJson(
       `${this.prompts.persona}\n\n${this.prompts.addressed}`,
-      JSON.stringify({ ...conversationData(comment, thread, relationships, this.speakerLabel), recentReplies: recentData(recentReplies) }),
-      { schema: ADDRESSED_SCHEMA },
+      serializeContext({ ...conversationData(comment, thread, relationships, this.speakerLabel), recentReplies: recentData(recentReplies) }),
+      { schema: ADDRESSED_SCHEMA, context: { videoId: comment.videoId, targetCid: comment.cid, stage: 'decision' } },
     );
     validateSchema(result, ADDRESSED_SCHEMA);
     if (!result.reason.trim()) throw outputError('语义判定必须给出原因');
@@ -107,29 +130,47 @@ class Agent {
   async generate(comment, { kinds = [], thread = [], recentReplies = [], relationships = {}, stickersEnabled = false, allowImageOnly = false } = {}) {
     const result = await this.llm.completeJson(
       `${this.prompts.persona}\n\n${this.prompts.reply}`,
-      JSON.stringify({
+      serializeContext({
         ...conversationData(comment, thread, relationships, this.speakerLabel),
         triggerKinds: Array.isArray(kinds) ? kinds : [],
         recentReplies: recentData(recentReplies),
         stickersEnabled: stickersEnabled === true,
         allowImageOnly: allowImageOnly === true,
       }),
-      { schema: REPLY_SCHEMA },
+      { schema: REPLY_SCHEMA, context: { videoId: comment.videoId, targetCid: comment.cid, stage: 'generation' } },
     );
     validateSchema(result, REPLY_SCHEMA);
-    const text = result.text.trim();
+    const rawText = result.text.trim();
     const stickerQuery = result.stickerQuery?.trim() || '';
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(rawText + stickerQuery)) {
+      throw outputError('模型回复包含控制字符');
+    }
+    const text = truncateReply(rawText);
     if (!text && stickerQuery && allowImageOnly !== true) {
       throw outputError('当前未启用纯图回复，模型必须提供文字或跳过');
-    }
-    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(text + stickerQuery)) {
-      throw outputError('模型回复包含控制字符');
     }
     const normalized = meaningfulText(text);
     if (text && (!normalized || recentData(recentReplies).some(previous => meaningfulText(previous) === normalized))) {
       throw outputError('模型回复无有效文字或重复近期回复，本次不发送');
     }
     return { text, ...(stickerQuery ? { stickerQuery } : {}) };
+  }
+
+  async reviewInput(comment, { thread = [], relationships = {} } = {}) {
+    return reviewSafety(this.llm, {
+      phase: 'input', data: serializeContext(conversationData(comment, thread, relationships, this.speakerLabel)),
+      context: { videoId: comment.videoId, targetCid: comment.cid, stage: 'input_safety' },
+    });
+  }
+
+  async reviewOutput(comment, reply, { thread = [], relationships = {} } = {}) {
+    return reviewSafety(this.llm, {
+      phase: 'output', data: serializeContext({
+        ...conversationData(comment, thread, relationships, this.speakerLabel),
+        reply: { text: String(reply?.text || ''), stickerQuery: String(reply?.stickerQuery || '') },
+      }),
+      context: { videoId: comment.videoId, targetCid: comment.cid, stage: 'output_safety' },
+    });
   }
 
   async chooseSticker(candidates, context = {}) {
@@ -154,7 +195,7 @@ class Agent {
         candidates: [...allowed.values()],
         context: { comment: textOf(context.comment), replyText: String(context.replyText || context.text || ''), stickerQuery: String(context.stickerQuery || '') },
       }),
-      { schema },
+      { schema, context: { videoId: context.comment?.videoId, targetCid: context.comment?.cid, stage: 'sticker' } },
     );
     validateSchema(result, schema);
     return result.id;

@@ -19,14 +19,18 @@ function parseVideoId(value) {
   return id;
 }
 
-function loadConfig(file = path.join(ROOT, 'config.local.json'), { requireAccount = false } = {}) {
-  if (!fs.existsSync(file)) throw new Error('请先运行 npm run init，随后填写 config.local.json');
-  const input = JSON.parse(fs.readFileSync(file, 'utf8'));
+function validateConfig(input, { root = ROOT, requireAccount = false } = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('配置必须是 JSON 对象');
   const config = { ...DEFAULTS, ...input };
-  for (const key of ['bridge', 'douyin', 'model', 'worker', 'stickers']) config[key] = { ...DEFAULTS[key], ...input[key] };
+  for (const key of ['bridge', 'douyin', 'model', 'worker', 'stickers', 'triggers']) {
+    if (input[key] != null && (typeof input[key] !== 'object' || Array.isArray(input[key]))) throw new Error(`${key} 必须是配置对象`);
+    config[key] = { ...DEFAULTS[key], ...input[key] };
+  }
   if (!Array.isArray(config.videos)) throw new Error('videos 必须是作品 ID 或链接数组');
   config.videos = [...new Set(config.videos.map(parseVideoId))];
   if (typeof config.accountUid !== 'string') throw new Error('accountUid 必须是字符串，不能使用 JSON 数字');
+  config.accountUid = config.accountUid.trim();
+  if (config.accountUid && !ID_RE.test(config.accountUid)) throw new Error('accountUid 必须是 5..30 位数字字符串');
   if (requireAccount && !ID_RE.test(config.accountUid)) throw new Error('请用 doctor 确认登录账号，再填写字符串 accountUid');
   if (config.bridge.host !== '127.0.0.1') throw new Error('Bridge 仅监听 127.0.0.1');
   if (typeof config.bridge.token !== 'string' || !/^[a-f\d]{48,}$/i.test(config.bridge.token)) throw new Error('bridge.token 未配置，请运行 npm run init');
@@ -41,29 +45,42 @@ function loadConfig(file = path.join(ROOT, 'config.local.json'), { requireAccoun
     ['worker.maxCandidatesPerRound', config.worker.maxCandidatesPerRound, 1, 1000],
   ]) if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${label} 必须是 ${min}..${max} 的整数`);
   if (!['deepseek', 'openai'].includes(config.model.provider)) throw new Error('model.provider 只支持 deepseek / openai');
-  if (typeof config.douyin.inboundSchemaConfirmed !== 'boolean' || typeof config.stickers.enabled !== 'boolean') throw new Error('功能开关必须是布尔值');
+  if (typeof config.douyin.inboundSchemaConfirmed !== 'boolean' || typeof config.stickers.enabled !== 'boolean' || typeof config.triggers.respondToNameCall !== 'boolean') throw new Error('功能开关必须是布尔值');
   if (!['optional', 'required'].includes(config.stickers.mode)) throw new Error('stickers.mode 只支持 optional / required');
-  config.root = ROOT;
-  config.runtimeDir = path.join(ROOT, 'runtime');
+  if (!['off', 'lazy'].includes(config.stickers.autoSync)) throw new Error('stickers.autoSync 只支持 off / lazy');
+  if (!Number.isInteger(config.stickers.limit) || config.stickers.limit < 1 || config.stickers.limit > 50) throw new Error('stickers.limit 必须是 1..50 的整数');
+  const allowedMimes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+  if (!Array.isArray(config.stickers.allowedMimeTypes) || !config.stickers.allowedMimeTypes.length || config.stickers.allowedMimeTypes.some(mime => !allowedMimes.includes(mime))) throw new Error('stickers.allowedMimeTypes 只能包含支持的图片格式');
+  new (require('./agent/llm').ChatClient)(config.model);
+  config.root = root;
+  config.runtimeDir = path.join(root, 'runtime');
   return config;
 }
 
-function loadLocalEnv() {
-  const file = path.join(ROOT, '.env.local');
-  if (fs.existsSync(file)) process.loadEnvFile(file);
+function loadConfig(file = path.join(ROOT, 'config.local.json'), options = {}) {
+  if (!fs.existsSync(file)) throw new Error('请先运行 npm run init，随后填写 config.local.json');
+  return validateConfig(JSON.parse(fs.readFileSync(file, 'utf8')), { root: path.dirname(file), ...options });
 }
 
-function initialize() {
-  const file = path.join(ROOT, 'config.local.json');
+function loadLocalEnv({ root = ROOT, override = false } = {}) {
+  const file = path.join(root, '.env.local');
+  if (!fs.existsSync(file)) return;
+  if (override) Object.assign(process.env, require('node:util').parseEnv(fs.readFileSync(file, 'utf8')));
+  else process.loadEnvFile(file);
+}
+
+function initialize({ root = ROOT } = {}) {
+  fs.mkdirSync(root, { recursive: true });
+  const file = path.join(root, 'config.local.json');
   if (!fs.existsSync(file)) {
     const config = structuredClone(DEFAULTS);
     config.bridge.token = crypto.randomBytes(24).toString('hex');
     fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   }
-  const envFile = path.join(ROOT, '.env.local');
+  const envFile = path.join(root, '.env.local');
   if (!fs.existsSync(envFile)) fs.copyFileSync(path.join(ROOT, '.env.example'), envFile, fs.constants.COPYFILE_EXCL);
   fs.chmodSync(envFile, 0o600);
-  const config = loadConfig(file);
+  const config = loadConfig(file, { root });
   fs.mkdirSync(config.runtimeDir, { recursive: true, mode: 0o700 });
   const source = fs.readFileSync(path.join(ROOT, 'userscript/dafeiyu-douyin.user.js'), 'utf8');
   const address = `http://${config.bridge.host}:${config.bridge.port}`;
@@ -72,4 +89,4 @@ function initialize() {
   return config;
 }
 
-module.exports = { ROOT, loadConfig, loadLocalEnv, initialize, parseVideoId };
+module.exports = { ROOT, DEFAULTS, loadConfig, validateConfig, loadLocalEnv, initialize, parseVideoId };

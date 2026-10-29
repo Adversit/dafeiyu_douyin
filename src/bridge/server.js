@@ -2,6 +2,7 @@
 const http = require('node:http');
 const { randomUUID, timingSafeEqual } = require('node:crypto');
 const { validateCommand, id, WRITE_COMMANDS } = require('./protocol');
+const { BROWSER_DISCONNECTED_MESSAGE } = require('./errors');
 
 // Poll queue and correlated receipts adapted from douyin-cli's MIT router;
 // see vendor/douyin-cli/NOTICE.md. One browser identity, no WebSocket or eval API.
@@ -24,7 +25,7 @@ function createBridgeServer({ token, host = '127.0.0.1', port = 19422, requestTi
   }
   function call(command, args) {
     validateCommand(command, args);
-    if (closed || !status().connected) return Promise.reject(Object.assign(new Error('Browser bridge is not connected'), { code: 'BRIDGE_REJECTED' }));
+    if (closed || !status().connected) return Promise.reject(Object.assign(new Error(BROWSER_DISCONNECTED_MESSAGE), { code: 'BRIDGE_REJECTED' }));
     if (session.accountUid !== args.accountUid) return Promise.reject(Object.assign(new Error('Connected browser identity does not match accountUid'), { code: 'BRIDGE_REJECTED' }));
     return new Promise((resolve, reject) => {
       const item = { id: randomUUID(), sessionId: session.id, command, args, resolve, reject, dispatched: false };

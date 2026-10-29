@@ -6,6 +6,112 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { webcrypto } = require('node:crypto');
 const SOURCE = fs.readFileSync(path.join(__dirname, '../userscript/dafeiyu-douyin.user.js'), 'utf8');
+
+test('root and reply readers use the respective platform video parameters and report the reply query version', async () => {
+  const { api, calls } = harness(url => url.includes('/query/user/')
+    ? { user_uid: '123456' } : { status_code: 0, comments: [], has_more: 0 });
+  await api.dispatch('comments.list', { accountUid: '123456', videoId: '11', cursor: '0' });
+  const reply = await api.dispatch('comments.replies', { accountUid: '123456', videoId: '11', rootCid: '22', cursor: '0' });
+  const root = new URLSearchParams(calls.find(c => c.url.includes('/comment/list/?')).url.split('?')[1]);
+  const child = new URLSearchParams(calls.find(c => c.url.includes('/comment/list/reply/')).url.split('?')[1]);
+  assert.equal(root.get('aweme_id'), '11'); assert.equal(root.has('item_id'), false);
+  assert.equal(child.get('item_id'), '11'); assert.equal(child.get('comment_id'), '22'); assert.equal(child.has('aweme_id'), false);
+  assert.equal(reply._bridge_reply_query, 'item_id-v1');
+  const invalid = harness(url => url.includes('/query/user/') ? { user_uid: '123456' } : null);
+  assert.equal(await invalid.api.dispatch('comments.replies', { accountUid: '123456', videoId: '11', rootCid: '22' }), null);
+});
+
+test('userscript permits an image-only comment but rejects an empty or unsafe payload', async () => {
+  const { api, calls } = harness(url => {
+    if (url.includes('/query/user/')) return { user_uid: '123456' };
+    if (url.includes('/aweme/detail/')) return { aweme_detail: { author: { uid: '123456' } } };
+    return { status_code: 0, comment: { cid: '44' } };
+  });
+  const args = { accountUid: '123456', videoId: '11', rootCid: '22', targetCid: '22', text: '', images: [{ uri: 'tos/file', format: 'gif', width: 20, height: 20 }] };
+  await api.dispatch('comments.publish', args);
+  const payload = new URLSearchParams(calls.find(c => c.url.includes('/comment/publish/')).init.body);
+  assert.equal(payload.get('text'), ''); assert.equal(payload.get('image_uri_list'), 'tos/file');
+  await assert.rejects(api.dispatch('comments.publish', { ...args, images: [] }), /payload/);
+  await assert.rejects(api.dispatch('comments.publish', { ...args, images: [{ ...args.images[0], uri: 'bad uri' }] }), /image/);
+  await assert.rejects(api.dispatch('comments.publish', { ...args, images: [{ ...args.images[0], uri: 123 }] }), /image/);
+});
+
+test('delete verifies the exact own reply in the specified thread then deletes exactly once', async () => {
+  let userChecks = 0;
+  const { api, calls } = harness(url => {
+    if (url.includes('/query/user/')) { userChecks++; return { user_uid: '123456' }; }
+    if (url.includes('/aweme/detail/')) return { aweme_detail: { aweme_id: '11', author: { uid: '123456' } } };
+    if (url.includes('/comment/list/reply/')) return { status_code: 0, has_more: 0, comments: [{ cid: '33', aweme_id: '11', reply_id: '22', user: { uid: '123456' } }] };
+    if (url.includes('/comment/delete')) return { status_code: 0 };
+    throw new Error(`unexpected ${url}`);
+  });
+  const result = await api.dispatch('comments.delete', { accountUid: '123456', videoId: '11', rootCid: '22', commentCid: '33' });
+  assert.equal(result.status_code, 0); assert.equal(userChecks, 2);
+  const writes = calls.filter(c => c.url.includes('/comment/delete'));
+  assert.equal(writes.length, 1); assert.equal(writes[0].init.method, 'POST');
+  assert.equal(new URLSearchParams(writes[0].url.split('?')[1]).get('cid'), '33');
+  const lookup = new URLSearchParams(calls.find(c => c.url.includes('/comment/list/reply/')).url.split('?')[1]);
+  assert.equal(lookup.get('item_id'), '11'); assert.equal(lookup.get('comment_id'), '22'); assert.equal(lookup.has('aweme_id'), false);
+});
+
+test('delete rejects other author, missing video/thread evidence, missing reply, and identity change before dispatch', async () => {
+  for (const change of ['author', 'conflictingAuthor', 'video', 'thread', 'missing', 'changedLogin', 'wrongOwner', 'wrongVideoDetail']) {
+    let checks = 0;
+    const { api, calls } = harness(url => {
+      if (url.includes('/query/user/')) return { user_uid: ++checks === 2 && change === 'changedLogin' ? '654321' : '123456' };
+      if (url.includes('/aweme/detail/')) return { aweme_detail: { aweme_id: change === 'wrongVideoDetail' ? '12' : '11', author: { uid: change === 'wrongOwner' ? '654321' : '123456' } } };
+      if (url.includes('/comment/list/reply/')) return { status_code: 0, has_more: 0, comments: change === 'missing' ? [] : [{
+        cid: '33', aweme_id: change === 'video' ? '12' : '11', reply_id: change === 'thread' ? '23' : '22', user: { uid: change === 'author' ? '654321' : '123456', ...(change === 'conflictingAuthor' ? { uid_str: '654321' } : {}) },
+      }] };
+      throw new Error('Unexpected write');
+    });
+    await assert.rejects(api.dispatch('comments.delete', { accountUid: '123456', videoId: '11', rootCid: '22', commentCid: '33' }));
+    assert.equal(calls.filter(c => c.url.includes('/comment/delete')).length, 0, change);
+  }
+});
+
+test('delete searches bounded pagination; stalled or incomplete pagination fails closed', async () => {
+  for (const mode of ['secondPage', 'stalled', 'unknown']) {
+    const { api, calls } = harness(url => {
+      if (url.includes('/query/user/')) return { user_uid: '123456' };
+      if (url.includes('/aweme/detail/')) return { aweme_detail: { aweme_id: '11', author: { uid: '123456' } } };
+      if (url.includes('/comment/list/reply/')) {
+        const cursor = new URLSearchParams(url.split('?')[1]).get('cursor');
+        if (mode === 'secondPage' && cursor === '20') return { status_code: 0, has_more: 0, comments: [{ cid: '33', aweme_id: '11', reply_id: '22', user: { uid: '123456' } }] };
+        return { status_code: 0, ...(mode === 'unknown' ? {} : { has_more: 1 }), cursor: mode === 'stalled' ? '0' : '20', comments: [] };
+      }
+      if (url.includes('/comment/delete')) return { status_code: 0 };
+      throw new Error('Unexpected');
+    });
+    const operation = api.dispatch('comments.delete', { accountUid: '123456', videoId: '11', rootCid: '22', commentCid: '33' });
+    if (mode === 'secondPage') await operation; else await assert.rejects(operation);
+    assert.equal(calls.filter(c => c.url.includes('/comment/delete')).length, mode === 'secondPage' ? 1 : 0, mode);
+  }
+});
+
+test('delete network failure remains outcome unknown and is never retried', async () => {
+  const { api, calls } = harness(url => {
+    if (url.includes('/query/user/')) return { user_uid: '123456' };
+    if (url.includes('/aweme/detail/')) return { aweme_detail: { aweme_id: '11', author: { uid: '123456' } } };
+    if (url.includes('/comment/list/reply/')) return { status_code: 0, has_more: 0, comments: [{ cid: '33', aweme_id: '11', reply_id: '22', user: { uid: '123456' } }] };
+    if (url.includes('/comment/delete')) throw new Error('network disconnected');
+    throw new Error('Unexpected');
+  });
+  await assert.rejects(api.dispatch('comments.delete', { accountUid: '123456', videoId: '11', rootCid: '22', commentCid: '33' }), e => e.outcomeUnknown === true);
+  assert.equal(calls.filter(c => c.url.includes('/comment/delete')).length, 1);
+});
+test('delete forwards a platform rejection receipt without retrying', async () => {
+  const { api, calls } = harness(url => {
+    if (url.includes('/query/user/')) return { user_uid: '123456' };
+    if (url.includes('/aweme/detail/')) return { aweme_detail: { aweme_id: '11', author: { uid: '123456' } } };
+    if (url.includes('/comment/list/reply/')) return { status_code: 0, has_more: 0, comments: [{ cid: '33', aweme_id: '11', reply_id: '22', user: { uid: '123456' } }] };
+    if (url.includes('/comment/delete')) return { status_code: 7, status_msg: 'rejected' };
+    throw new Error('Unexpected');
+  });
+  const receipt = await api.dispatch('comments.delete', { accountUid: '123456', videoId: '11', rootCid: '22', commentCid: '33' });
+  assert.equal(receipt.status_code, 7);
+  assert.equal(calls.filter(c => c.url.includes('/comment/delete')).length, 1);
+});
 function harness(fetcher) {
   const calls = [];
   const context = { GM_getValue: () => 'fixture-token', GM_registerMenuCommand() {},

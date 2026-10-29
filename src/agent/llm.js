@@ -44,8 +44,31 @@ function validateSchema(value, schema, path = '$') {
   }
 }
 
+// Limit the raw provider response before JSON parsing, including envelope data.
+async function readResponseJson(response) {
+  if (!response.body || typeof response.body.getReader !== 'function') return response.json();
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 1024 * 1024) {
+        await reader.cancel().catch(() => {});
+        throw failure('LLM_RESPONSE_TOO_LARGE', '模型响应过大，本次不发送');
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 class ChatClient {
-  constructor(config = {}, { fetchImpl = globalThis.fetch } = {}) {
+  constructor(config = {}, { fetchImpl = globalThis.fetch, log = () => {} } = {}) {
     this.provider = config.provider || 'deepseek';
     const defaults = PROVIDERS[this.provider];
     if (!defaults) throw failure('LLM_PROVIDER_INVALID', '模型供应商只支持 deepseek 或 openai');
@@ -74,9 +97,10 @@ class ChatClient {
       throw failure('LLM_CONFIG_INVALID', '模型请求的超时、输出上限或 fetch 实现无效');
     }
     this.fetchImpl = fetchImpl;
+    this.log = log;
   }
 
-  async completeJson(system, user, { schema } = {}) {
+  async completeJson(system, user, { schema, context = {} } = {}) {
     const key = process.env[this.apiKeyEnv]?.trim();
     if (!key) throw failure('LLM_KEY_MISSING', `未配置模型密钥环境变量 ${this.apiKeyEnv}`);
     if (typeof system !== 'string' || !system.trim() || typeof user !== 'string') {
@@ -98,7 +122,11 @@ class ChatClient {
     };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const startedAt = Date.now();
+    const logContext = { videoId: context.videoId, targetCid: context.targetCid, stage: context.stage || 'model' };
     try {
+      this.log({ ...logContext, level: 'debug', event: 'model.request', message: '正在请求模型',
+        data: { provider: this.provider, model: this.model, messages: body.messages } });
       let response;
       try {
         response = await this.fetchImpl(this.endpoint, {
@@ -114,7 +142,8 @@ class ChatClient {
       }
       if (!response.ok) throw failure('LLM_HTTP_ERROR', `模型服务请求失败（HTTP ${Number(response.status) || 0}）`);
       let data;
-      try { data = await response.json(); } catch {
+      try { data = await readResponseJson(response); } catch (error) {
+        if (error.code === 'LLM_RESPONSE_TOO_LARGE') throw error;
         throw failure('LLM_RESPONSE_INVALID', '模型服务返回了无效响应');
       }
       const choice = data?.choices?.[0];
@@ -129,7 +158,13 @@ class ChatClient {
       }
       if (!matchesType(result, 'object')) throw failure('LLM_JSON_INVALID', '模型必须返回一个 JSON 对象');
       validateSchema(result, schema);
+      this.log({ ...logContext, level: 'debug', event: 'model.response', message: '模型已返回有效结果',
+        data: { provider: this.provider, model: this.model, durationMs: Date.now() - startedAt, result } });
       return result;
+    } catch (error) {
+      this.log({ ...logContext, level: 'error', event: 'model.error', message: error.message,
+        data: { provider: this.provider, model: this.model, durationMs: Date.now() - startedAt, code: error.code } });
+      throw error;
     } finally {
       clearTimeout(timer);
     }

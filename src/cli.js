@@ -2,20 +2,20 @@
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
-const { setTimeout: sleep } = require('node:timers/promises');
 const { ROOT, initialize, loadConfig, loadLocalEnv, parseVideoId } = require('./config');
 const { BridgeClient } = require('./bridge/client');
 const { createBridgeServer } = require('./bridge/server');
 const { DouyinAdapter } = require('./douyin/adapter');
 const { Store } = require('./store');
-const { Worker } = require('./worker');
 const { acquireLock } = require('./lock');
-const { ChatClient } = require('./agent/llm');
-const { Agent } = require('./agent/reply');
-const { StickerService } = require('./stickers/service');
+const { RuntimeController } = require('./services/runtime');
+const { EventLogger } = require('./services/logger');
+const { diagnose } = require('./services/diagnostics');
 
 const print = value => console.log(JSON.stringify(value, null, 2));
 const HELP = `大肥鱼抖音评论 Agent
+
+npm run launch                          打开本地网页控制台（不自动发送）
 
 node src/cli.js init                     创建本地配置及空密钥文件
 node src/cli.js bridge                   启动本地浏览器 Bridge
@@ -66,23 +66,9 @@ async function main(args = process.argv.slice(2)) {
     return;
   }
   if (command === 'doctor') {
-    const { bridge, adapter } = dependencies(config);
-    let status;
-    try { status = await bridge.status(); } catch { status = { connected: false, error: 'Bridge 未启动或 Token 不匹配' }; }
-    const model = new ChatClient(config.model);
-    const report = { browser: status, configuredAccount: config.accountUid || null,
-      model: { provider: model.provider, model: model.model, keyConfigured: Boolean(process.env[model.apiKeyEnv]?.trim()) },
-      relationshipTriggersReady: config.douyin.inboundSchemaConfirmed,
-      note: 'doctor 不调用模型、不发送评论。关系字段须由 inspect 真实样本确认后开启。', videos: [] };
-    if (status.connected && status.accountUid) {
-      const identity = await bridge.call('identity.get', { accountUid: status.accountUid });
-      report.browser.identity = identity;
-      if (config.accountUid) for (const id of config.videos) {
-        try { await adapter.verifyVideo(id); report.videos.push({ id, owned: true }); }
-        catch (e) { report.videos.push({ id, owned: false, error: e.message }); }
-      }
-    }
-    print(report); return;
+    const { bridge } = dependencies(config);
+    const runtime = new RuntimeController({ root: ROOT });
+    print(await diagnose({ config, bridge, runtime })); return;
   }
   if (command === 'inspect') {
     const ids = args[1] ? [parseVideoId(args[1])] : config.videos;
@@ -109,35 +95,24 @@ async function main(args = process.argv.slice(2)) {
     const release = acquireLock(path.join(config.runtimeDir, 'worker.lock'));
     const store = new Store(path.join(config.runtimeDir, 'agent.sqlite'));
     try {
-      const result = store.db.prepare("UPDATE jobs SET status='pending',reason=NULL,updated_at=? WHERE job_key=? AND account_uid=? AND status='failed'").run(Date.now(), args[1], config.accountUid);
-      if (result.changes !== 1) throw new Error('仅能重试当前账号的 failed 任务；unknown 结果须先核对平台');
+      store.retryFailed(args[1], config.accountUid);
       print({ requeued: args[1] });
     } finally { store.close(); release(); }
     return;
   }
   if (command !== 'run') throw new Error('未知命令；使用 node src/cli.js --help');
-  if (!config.videos.length) throw new Error('请手动填写 config.local.json 的 videos 列表');
-  const llm = new ChatClient(config.model);
-  if (!process.env[llm.apiKeyEnv]?.trim()) throw new Error(`尚未填写 ${llm.apiKeyEnv}；不会创建发送任务`);
-  const release = acquireLock(path.join(config.runtimeDir, 'worker.lock'));
-  let store;
-  const controller = new AbortController();
-  const stop = () => controller.abort();
+  const logger = new EventLogger({ directory: path.join(config.runtimeDir, 'logs'), secretValues: () => [config.bridge.token] });
+  const unsubscribe = logger.subscribe(entry => print(entry.event === 'round.completed' ? entry.data : entry));
+  const runtime = new RuntimeController({ root: ROOT, logger });
+  const stop = () => runtime.stop();
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   try {
-    store = new Store(path.join(config.runtimeDir, 'agent.sqlite'));
-    store.recoverInFlight();
-    const { adapter } = dependencies(config);
-    const stickers = new StickerService({ enabled: config.stickers.enabled, cacheDir: path.join(config.runtimeDir, 'stickers'), autoSync: config.stickers.autoSync, mode: 'original' });
-    const worker = new Worker({ config, adapter, store, agent: new Agent({ llm }), stickers, log: print });
-    do {
-      print(await worker.runOnce({ signal: controller.signal }));
-      if (args.includes('--once')) break;
-      await sleep(config.worker.pollIntervalMs, undefined, { signal: controller.signal });
-    } while (!controller.signal.aborted);
+    await runtime.start({ once: args.includes('--once') });
+    const final = await runtime.wait();
+    if (final.error) throw new Error(final.error);
   } finally {
     process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
-    store?.close(); release();
+    unsubscribe(); logger.close();
   }
 }
 

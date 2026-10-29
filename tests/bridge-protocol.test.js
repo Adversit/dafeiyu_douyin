@@ -6,6 +6,30 @@ const { createBridgeServer } = require('../src/bridge/server');
 const { BridgeClient } = require('../src/bridge/client');
 const { validateCommand } = require('../src/bridge/protocol');
 const TOKEN = 'test-token-for-local-fixture'; const ACCOUNT = '123456';
+
+test('delete requires an owned video, explicit thread and distinct published reply ID', () => {
+  const args = { accountUid: ACCOUNT, videoId: '11', rootCid: '22', commentCid: '33' };
+  assert.equal(validateCommand('comments.delete', args).command, 'comments.delete');
+  for (const changed of [{ commentCid: '22' }, { commentCid: 33 }, { rootCid: undefined }, { videoId: '../other' }]) {
+    assert.throws(() => validateCommand('comments.delete', { ...args, ...changed }));
+  }
+});
+test('publish permits verified image-only payloads but never an empty reply or invalid image', () => {
+  const args = { accountUid: ACCOUNT, videoId: '11', targetCid: '22', text: '', images: [{ uri: 'tos/file', format: 'gif', width: 20, height: 20 }] };
+  assert.equal(validateCommand('comments.publish', args).command, 'comments.publish');
+  assert.throws(() => validateCommand('comments.publish', { ...args, images: [] }), /text|image/i);
+  assert.throws(() => validateCommand('comments.publish', { ...args, images: [{ ...args.images[0], uri: '../bad uri' }] }), /image/i);
+});
+test('dispatched delete timeouts are unknown; delete is never redispatched by the bridge', async t => {
+  const { bridge, port } = await setup(t, { requestTimeout: 40 });
+  const connected = await request(port, '/api/connect', { accountUid: ACCOUNT });
+  const operation = bridge.call('comments.delete', { accountUid: ACCOUNT, videoId: '11', rootCid: '22', commentCid: '33' });
+  const failed = assert.rejects(operation, error => error.outcomeUnknown === true);
+  const poll = await request(port, '/api/poll', { sessionId: connected.sessionId });
+  assert.equal(poll.command, 'comments.delete');
+  await failed;
+  assert.equal(bridge.status().pending, 0);
+});
 function request(port, route, body, token = TOKEN, headers = {}) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : JSON.stringify(body);

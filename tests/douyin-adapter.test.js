@@ -6,13 +6,27 @@ const os = require('node:os');
 const path = require('node:path');
 const { DouyinAdapter, normalizeComment } = require('../src/douyin/adapter');
 const ACCOUNT = '123456'; const VIDEO = '1234567890123456789';
+
+test('在发布前核验期间停止不调用发布接口，并提供明确未发送证据', async () => {
+  const controller = new AbortController(); let writes = 0;
+  const adapter = new DouyinAdapter({ accountUid: ACCOUNT, bridge: { async call(command) {
+    if (command === 'identity.get') return { uid: ACCOUNT };
+    if (command === 'video.get') { controller.abort(); return { aweme_detail: { author: { uid: ACCOUNT } } }; }
+    writes++; throw new Error('Must not publish');
+  } } });
+  await assert.rejects(adapter.publishReply({ videoId: VIDEO, targetCid: '1', text: '收到', signal: controller.signal }),
+    error => error.name === 'AbortError' && error.definitelyNotSent === true && error.outcomeUnknown === false);
+  assert.equal(writes, 0);
+});
 function bridgeWith(handler = () => { throw new Error('Unexpected command'); }) {
   const calls = [];
   return { calls, async call(command, args) {
     calls.push({ command, args });
     if (command === 'identity.get') return { uid: ACCOUNT };
     if (command === 'video.get') return { status_code: 0, aweme_detail: { author: { uid: ACCOUNT }, desc: 'Owned fixture' } };
-    return handler(command, args);
+    const value = await handler(command, args);
+    return command === 'comments.replies' && value && typeof value === 'object'
+      ? { status_code: 0, _bridge_reply_query: 'item_id-v1', ...value } : value;
   } };
 }
 test('normalization keeps full text and never infers a direct target from tree position', () => {

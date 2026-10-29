@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { ChatClient } = require('../src/agent/llm');
+const { Agent } = require('../src/agent/reply');
 
 const keyEnv = 'DAFEIYU_UNIT_TEST_LLM_KEY';
 const fakeKey = 'unit-test-key-never-sent-to-network';
@@ -76,6 +77,34 @@ test('非法JSON、截断、非对象、类型错误和拒绝响应均不返回�
     const client = new ChatClient({ apiKeyEnv: keyEnv }, { fetchImpl: async () => result });
     await assert.rejects(client.completeJson('规则', '{}', { schema }));
   }
+});
+
+test('真实客户端处理合法长回复后由 Agent 截断，长度截断和未完整 JSON 仍不发送', async t => {
+  process.env[keyEnv] = fakeKey;
+  t.after(() => { delete process.env[keyEnv]; });
+  const outputs = [
+    response(JSON.stringify({ text: '鱼'.repeat(151), stickerQuery: null })),
+    response(JSON.stringify({ text: '鱼'.repeat(151), stickerQuery: null }), { finish_reason: 'length' }),
+    response('{"text":"鱼'),
+  ];
+  const client = new ChatClient({ apiKeyEnv: keyEnv }, { fetchImpl: async () => outputs.shift() });
+  const agent = new Agent({ llm: client });
+  assert.equal((await agent.generate({ text: '大肥鱼' })).text, '鱼'.repeat(150));
+  await assert.rejects(agent.generate({ text: '大肥鱼' }), { code: 'LLM_TRUNCATED' });
+  await assert.rejects(agent.generate({ text: '大肥鱼' }), { code: 'LLM_JSON_INVALID' });
+});
+
+test('模型响应体超限时停止读取并拒绝，避免解析无限响应', async t => {
+  process.env[keyEnv] = fakeKey;
+  t.after(() => { delete process.env[keyEnv]; });
+  let canceled = false;
+  const body = new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(1024 * 1024 + 1)); },
+    cancel() { canceled = true; },
+  });
+  const client = new ChatClient({ apiKeyEnv: keyEnv }, { fetchImpl: async () => ({ ok: true, body }) });
+  await assert.rejects(client.completeJson('规则', '{}'), { code: 'LLM_RESPONSE_TOO_LARGE' });
+  assert.equal(canceled, true);
 });
 
 test('供应商/网络报错不回显响应体、底层错误或key，且没有自动重试', async t => {

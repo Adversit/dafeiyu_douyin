@@ -1,6 +1,7 @@
 'use strict';
 const http = require('node:http');
 const { validateCommand, WRITE_COMMANDS } = require('./protocol');
+const { translateBridgeError } = require('./errors');
 class BridgeClient {
   constructor({ host = '127.0.0.1', port = 19422, token, timeout = 35000 } = {}) {
     if (!['127.0.0.1', 'localhost', '::1'].includes(host)) throw new Error('Bridge must use a loopback host');
@@ -41,7 +42,7 @@ class BridgeClient {
               } else if (error.code === 'BRIDGE_REJECTED') {
                 error.outcomeUnknown = false; error.definitelyNotSent = true;
               }
-              reject(error);
+              reject(translateBridgeError(error));
             } else resolve(result.value === undefined ? result : result.value);
           } catch (error) { reject(error); }
         });

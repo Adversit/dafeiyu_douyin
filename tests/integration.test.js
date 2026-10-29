@@ -37,6 +37,7 @@ test('真实Bridge/adapter/Agent/SQLite串联，模型与浏览器模拟，跨�
       if (command.command === 'identity.get') value = { uid: accountUid };
       else if (command.command === 'video.get') value = { status_code: 0, aweme_detail: { author: { uid: accountUid } } };
       else if (command.command === 'comments.list') value = { status_code: 0, has_more: 0, comments: [{ cid: targetCid, user: { uid: '30001' }, text: '大肥鱼你在干嘛呀', text_extra: [{ type: 0, user_id: accountUid }], reply_comment_total: 0 }] };
+      else if (command.command === 'comments.replies') value = { status_code: 0, _bridge_reply_query: 'item_id-v1', has_more: 0, comments: [] };
       else if (command.command === 'comments.publish') {
         writes++;
         assert.equal(a.targetCid, targetCid); assert.equal(a.videoId, videoId); assert.equal(a.accountUid, accountUid);
@@ -49,15 +50,18 @@ test('真实Bridge/adapter/Agent/SQLite串联，模型与浏览器模拟，跨�
   const previous = process.env.DAFEIYU_TEST_KEY;
   process.env.DAFEIYU_TEST_KEY = 'mock-only-not-a-real-key';
   t.after(() => { if (previous === undefined) delete process.env.DAFEIYU_TEST_KEY; else process.env.DAFEIYU_TEST_KEY = previous; });
-  const llm = new ChatClient({ provider: 'deepseek', apiKeyEnv: 'DAFEIYU_TEST_KEY' }, { fetchImpl: async () => {
+  const llm = new ChatClient({ provider: 'deepseek', apiKeyEnv: 'DAFEIYU_TEST_KEY' }, { fetchImpl: async (_url, options) => {
     modelCalls++;
-    return { ok: true, json: async () => ({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ text: '鱼正在认真摸鱼呢', stickerQuery: null }) } }] }) };
+    const request = JSON.parse(options.body);
+    const result = request.messages[0].content.includes('独立的评论安全分类器')
+      ? { safe: true, reason: '安全' } : { text: '鱼正在认真摸鱼呢', stickerQuery: null };
+    return { ok: true, json: async () => ({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(result) } }] }) };
   } });
   const adapter = new DouyinAdapter({ accountUid, inboundSchemaConfirmed: true, bridge: new BridgeClient({ port, token }) });
   const worker = new Worker({ config: { accountUid, videos: [videoId], douyin: {}, worker: { maxRepliesPerRound: 3, maxCandidatesPerRound: 30, sendIntervalMs: 1000 }, stickers: { enabled: false } }, adapter, agent: new Agent({ llm }), store, sleep: async () => {} });
   assert.equal((await worker.runOnce()).sent, 1);
   assert.equal((await worker.runOnce()).attempted, 0);
-  assert.equal(writes, 1); assert.equal(modelCalls, 1);
+  assert.equal(writes, 1); assert.equal(modelCalls, 3);
 });
 
 test('已安装的真实nekowhale包可离线检索，不加载DSH或下载GIF', async t => {

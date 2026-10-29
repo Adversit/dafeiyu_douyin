@@ -5,7 +5,7 @@ function id(value) {
 }
 
 /** Structural evidence is evaluated locally; ordinary text goes to semantic review. */
-function evaluateTrigger(comment, { accountUid, ownCommentIds = [] } = {}) {
+function evaluateTrigger(comment, { accountUid, ownCommentIds = [], respondToNameCall = true } = {}) {
   const relationships = {
     replyRelationKnown: false, mentionsKnown: false,
     isReplyToSelf: false, isReplyToOther: false,
@@ -49,6 +49,11 @@ function evaluateTrigger(comment, { accountUid, ownCommentIds = [] } = {}) {
       result.evidence.push('structured_mention_uid');
     }
     if (relationships.isMentioningOther) result.evidence.push('structured_mention_other_uid');
+  }
+  // A complete call is distinct from merely mentioning the character's name.
+  if (respondToNameCall && /^大肥鱼[\s!！?？~～。.,，、…]*$/u.test(comment.text.trim())) {
+    result.kinds.push('name_call');
+    result.evidence.push('direct_character_name_call');
   }
   result.eligible = result.kinds.length > 0;
   result.needsSemantic = !result.eligible;

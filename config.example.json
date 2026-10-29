@@ -1,6 +1,9 @@
 {
   "accountUid": "",
   "videos": [],
+  "triggers": {
+    "respondToNameCall": true
+  },
   "bridge": {
     "host": "127.0.0.1",
     "port": 19422,

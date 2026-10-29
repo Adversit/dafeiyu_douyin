@@ -56,7 +56,7 @@ SOFTWARE.
   const screen = page.screen;
   const crypto = page.crypto;
   const PAGE_LOAD_TIME = Date.now();
-  const COMMANDS = new Set(['identity.get', 'video.get', 'comments.list', 'comments.replies', 'images.begin', 'images.append', 'images.upload', 'images.reset', 'comments.publish']);
+  const COMMANDS = new Set(['identity.get', 'video.get', 'comments.list', 'comments.replies', 'comments.delete', 'images.begin', 'images.append', 'images.upload', 'images.reset', 'comments.publish']);
   const buffers = new Map();
   function getCookie(name) {
     const item = document.cookie.split(';').map(x => x.trim()).find(x => x.startsWith(name + '='));
@@ -225,6 +225,35 @@ SOFTWARE.
     if (String(data.aweme_detail?.author?.uid || data.aweme_detail?.author?.uid_str || '') !== uid) throw new Error('Video ownership mismatch');
     return data;
   }
+  function responseId(value) {
+    if (typeof value === 'string' && /^\d{1,30}$/.test(value)) return value;
+    if (Number.isSafeInteger(value) && value >= 0) return String(value);
+    return '';
+  }
+  // Only delete a reply whose location and author are explicitly confirmed by
+  // the platform. Agent provenance is independently checked by the caller.
+  async function verifyOwnReply(videoId, rootCid, commentCid, uid) {
+    let cursor = '0';
+    const seen = new Set([cursor]);
+    for (let page = 0; page < 50; page++) {
+      const params = new URLSearchParams({ ...api._q(), item_id: videoId, comment_id: rootCid, cursor, count: '20', item_type: '0', pc_img_format: 'webp', cut_version: '1' });
+      const data = await bridgeFetchJson('comments.replies', '/aweme/v1/web/comment/list/reply/?' + params, { credentials: 'include' });
+      if (!data || (data.status_code !== undefined && data.status_code !== 0) || !Array.isArray(data.comments)) throw new Error('Reply lookup rejected or incomplete');
+      const match = data.comments.find(comment => responseId(comment?.cid) === commentCid);
+      if (match) {
+        const author = match.user;
+        const identities = author && typeof author === 'object' ? [author.uid, author.uid_str].filter(value => value !== undefined && value !== null) : [];
+        if (responseId(match.aweme_id) !== videoId || responseId(match.reply_id) !== rootCid || !identities.length || identities.some(value => responseId(value) !== uid)) throw new Error('Reply identity or thread mismatch');
+        return;
+      }
+      if (![true, false, 0, 1].includes(data.has_more)) throw new Error('Reply pagination is incomplete');
+      if (!data.has_more) throw new Error('Reply not found');
+      const next = responseId(data.cursor);
+      if (!next || seen.has(next)) throw new Error('Reply pagination did not advance');
+      seen.add(next); cursor = next;
+    }
+    throw new Error('Reply lookup exceeded page limit');
+  }
   async function dispatch(command, args) {
     if (!COMMANDS.has(command)) throw new Error('Unsupported command');
     decimal(args?.accountUid, 'accountUid');
@@ -237,9 +266,25 @@ SOFTWARE.
       case 'comments.replies': {
         decimal(args.videoId, 'videoId'); decimal(args.cursor || '0', 'cursor');
         if (command === 'comments.replies') decimal(args.rootCid, 'rootCid');
-        const params = new URLSearchParams({ ...api._q(), aweme_id: args.videoId, cursor: args.cursor || '0', count: String(Math.min(20, args.count || 20)), item_type: '0', pc_img_format: 'webp', cut_version: '1' });
-        if (command === 'comments.replies') params.set('comment_id', args.rootCid);
-        return bridgeFetchJson(command, '/aweme/v1/web/comment/list/' + (command === 'comments.replies' ? 'reply/' : '') + '?' + params, { credentials: 'include' });
+        const params = new URLSearchParams({ ...api._q(), cursor: args.cursor || '0', count: String(Math.min(20, args.count || 20)), item_type: '0', pc_img_format: 'webp', cut_version: '1' });
+        if (command === 'comments.replies') { params.set('item_id', args.videoId); params.set('comment_id', args.rootCid); }
+        else params.set('aweme_id', args.videoId);
+        const response = await bridgeFetchJson(command, '/aweme/v1/web/comment/list/' + (command === 'comments.replies' ? 'reply/' : '') + '?' + params, { credentials: 'include' });
+        // This local marker lets the bridge distinguish a corrected request
+        // from an older installed script, which used the wrong video parameter.
+        if (command === 'comments.replies' && response && typeof response === 'object' && !Array.isArray(response)) return { ...response, _bridge_reply_query: 'item_id-v1' };
+        return response;
+      }
+      case 'comments.delete': {
+        decimal(args.videoId, 'videoId'); decimal(args.rootCid, 'rootCid'); decimal(args.commentCid, 'commentCid');
+        if (args.rootCid === args.commentCid || [args.videoId, args.rootCid, args.commentCid].some(value => /^0+$/.test(value))) throw new Error('Invalid reply delete target');
+        const video = await ownVideo(args.videoId, uid);
+        if (responseId(video.aweme_detail?.aweme_id) !== args.videoId) throw new Error('Video identity mismatch');
+        await verifyOwnReply(args.videoId, args.rootCid, args.commentCid, uid);
+        if (await strictUid() !== uid) throw new Error('Login changed before deleting');
+        // Adapted from douyin-cli's deleteComment (MIT); writing is never retried.
+        const params = new URLSearchParams({ ...api._q(), cid: args.commentCid, channel_id: '0', app_name: 'aweme' });
+        return bridgeFetchJson('comments.delete', '/aweme/v1/web/comment/delete?' + params, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body: '', credentials: 'include' }, false);
       }
       case 'images.begin': {
         if (!/^[a-zA-Z0-9-]{1,80}$/.test(args.uploadId) || !Number.isInteger(args.expectedLength) || args.expectedLength < 1 || args.expectedLength > 14 * 1024 * 1024) throw new Error('Invalid upload buffer');
@@ -262,7 +307,7 @@ SOFTWARE.
       }
       case 'comments.publish': {
         decimal(args.videoId, 'videoId'); decimal(args.targetCid, 'targetCid'); if (args.rootCid) decimal(args.rootCid, 'rootCid');
-        if (typeof args.text !== 'string' || !args.text.trim() || args.text.length > 3000 || !Array.isArray(args.images) || args.images.length > 9) throw new Error('Invalid reply payload');
+        if (typeof args.text !== 'string' || args.text.length > 3000 || !Array.isArray(args.images) || args.images.length > 9 || (!args.text.trim() && !args.images.length)) throw new Error('Invalid reply payload');
         await ownVideo(args.videoId, uid);
         // A second fresh login read immediately precedes the only publishing call.
         if (await strictUid() !== uid) throw new Error('Login changed before publishing');
@@ -272,7 +317,7 @@ SOFTWARE.
           comment_send_celltime: String(Math.floor((Date.now() - PAGE_LOAD_TIME) / 1000) * 1000), comment_video_celltime: '0' });
         if (rrid) body.set('reply_to_reply_id', rrid);
         if (args.images.length) {
-          for (const image of args.images) if (!image || !/^[A-Za-z0-9_./-]{1,1024}$/.test(image.uri) || !['gif', 'jpeg', 'png', 'webp', 'bmp', 'heic'].includes(image.format) || ![image.width, image.height].every(n => Number.isInteger(n) && n > 0 && n <= 50000)) throw new Error('Invalid uploaded image');
+          for (const image of args.images) if (!image || typeof image.uri !== 'string' || !/^[A-Za-z0-9_./-]{1,1024}$/.test(image.uri) || !['gif', 'jpeg', 'png', 'webp', 'bmp', 'heic'].includes(image.format) || ![image.width, image.height].every(n => Number.isInteger(n) && n > 0 && n <= 50000)) throw new Error('Invalid uploaded image');
           body.set('image_uri_list', args.images.map(x => x.uri).join(',')); body.set('image_formats', args.images.map(x => x.format).join(','));
           body.set('image_widths', args.images.map(x => x.width).join(',')); body.set('image_heights', args.images.map(x => x.height).join(','));
         }

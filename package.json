@@ -1,9 +1,11 @@
 {
   "name": "dafeiyu-douyin-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Manually scoped Douyin comment agent adapted from douyin-cli and nekowhale-stickers",
-  "engines": { "node": ">=20.12" },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "scripts": {
     "init": "node src/cli.js init",
     "bridge": "node src/cli.js bridge",
@@ -12,11 +14,28 @@
     "once": "node src/cli.js run --once",
     "start": "node src/cli.js run",
     "status": "node src/cli.js status",
+    "web": "node src/web/server.js",
+    "launch": "node scripts/launch.js",
+    "build": "vite build --config web/vite.config.mjs",
+    "dev:web": "vite --config web/vite.config.mjs",
     "check": "node scripts/check.js",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js web/tests/*.test.mjs"
   },
   "dependencies": {
+    "@ant-design/icons": "6.3.4",
+    "@fastify/static": "10.1.2",
+    "antd": "6.6.8",
     "better-sqlite3": "11.10.0",
-    "dsh-nekowhale-stickers": "1.1.1"
+    "dsh-nekowhale-stickers": "1.1.1",
+    "fastify": "5.12.7",
+    "pino": "10.4.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "vite": "7.3.7"
+  },
+  "overrides": {
+    "light-my-request": "6.6.0"
   }
 }

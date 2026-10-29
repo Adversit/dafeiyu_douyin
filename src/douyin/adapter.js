@@ -72,6 +72,57 @@ class DouyinAdapter {
     if (!detail || optionalId(detail.author?.uid ?? detail.author?.uid_str) !== this.accountUid) throw Object.assign(new Error('Video does not belong to configured accountUid, or author identity is missing'), { code: 'OWNERSHIP_MISMATCH' });
     return detail;
   }
+  async _walkPages(videoId, command, args, limit, consume, { label = command, startCursor = '0', signal, requireStable = false, nullReply = 'reject' } = {}) {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10000) throw new Error('Pagination limits must be positive integers');
+    if (typeof startCursor !== 'string' || !/^\d{1,30}$/.test(startCursor)) throw new Error('Invalid continuation cursor');
+    let cursor = startCursor;
+    const cursors = new Set([cursor]); const pageSeen = new Set();
+    for (let page = 0; page < limit; page++) {
+      signal?.throwIfAborted();
+      const data = checkResult(await this._call(command, { ...args, videoId, cursor, count: 20 }), command);
+      signal?.throwIfAborted();
+      if (command === 'comments.replies' && (data._bridge_reply_query !== 'item_id-v1' || data.status_code !== 0)) {
+        const warning = data._bridge_reply_query !== 'item_id-v1'
+          ? '抖音回复查询可能来自旧油猴脚本；请更新脚本并刷新抖音页面'
+          : '抖音回复查询未返回明确成功状态';
+        if (nullReply === 'incomplete') return { nextCursor: cursor, warning: `${label}: ${warning}；本楼未完整读取`, stopped: false };
+        throw new Error(warning);
+      }
+      if (!Array.isArray(data.comments)) {
+        // The live reply endpoint uses null for some empty-looking pages. It is
+        // only safe to call the first page empty when the root also says zero.
+        const emptyReply = command === 'comments.replies' && data.status_code === 0 && data.comments === null &&
+          (data.has_more === 0 || data.has_more === false) && cursor === '0' && pageSeen.size === 0;
+        if (emptyReply && nullReply === 'known-empty' && data._bridge_reply_query === 'item_id-v1' &&
+            (data.total === 0 || data.total === '0')) {
+          await consume([]);
+          return { nextCursor: null, warning: null, stopped: false };
+        }
+        if (emptyReply && nullReply === 'incomplete') {
+          const hint = data._bridge_reply_query === 'item_id-v1' ? '' : '；请更新油猴脚本并刷新抖音页面';
+          return { nextCursor: cursor, warning: `${label}: 回复列表为空值且楼层计数无法确认；本楼未完整读取，将继续检查${hint}`, stopped: false };
+        }
+        if (emptyReply && data._bridge_reply_query !== 'item_id-v1') throw new Error('抖音回复查询可能来自旧油猴脚本；请更新脚本并刷新抖音页面后重试');
+        if (emptyReply) throw new Error('抖音回复列表为空，无法确认该楼回复是否完整');
+        throw new Error(`${command} response has no comments array`);
+      }
+      let newIds = 0;
+      for (const raw of data.comments) {
+        const cid = requirePlatformId(raw.cid, 'comment cid');
+        if (pageSeen.has(cid)) {
+          if (requireStable) throw Object.assign(new Error(`${label}: duplicate comment during pagination; thread may have changed`), { code: 'THREAD_INCOMPLETE' });
+        } else { newIds++; pageSeen.add(cid); }
+      }
+      if (await consume(data.comments) === false) return { nextCursor: null, warning: null, stopped: true };
+      const moreKnown = [true, false, 0, 1].includes(data.has_more);
+      if (!moreKnown) return { nextCursor: null, warning: `${label}: has_more is missing or unrecognized; no safe continuation is available`, stopped: false };
+      if (!data.has_more) return { nextCursor: null, warning: null, stopped: false };
+      const next = data.cursor === 0 || data.cursor === '0' ? '0' : optionalId(data.cursor);
+      if (!next || cursors.has(next) || newIds === 0) throw Object.assign(new Error(`${label}: pagination stalled (cursor did not advance or page made no progress)`), { code: 'PAGINATION_STALLED' });
+      cursors.add(next); cursor = next;
+    }
+    return { nextCursor: cursor, warning: `${label}: page limit ${limit} reached; continue from cursor ${cursor}`, stopped: false };
+  }
   async scanVideo(videoId, { maxPages = 50, maxReplyPages = 50, continuation = null } = {}) {
     for (const limit of [maxPages, maxReplyPages]) if (!Number.isInteger(limit) || limit < 1 || limit > 10000) throw new Error('Pagination limits must be positive integers');
     if (continuation && (typeof continuation !== 'object' || !Array.isArray(continuation.replies))) throw new Error('Invalid scan continuation');
@@ -83,23 +134,10 @@ class DouyinAdapter {
       if (!seen.has(event.cid)) { seen.add(event.cid); comments.push(event); }
     };
     const readPages = async (command, args, limit, consume, label, startCursor = '0') => {
-      if (typeof startCursor !== 'string' || !/^\d{1,30}$/.test(startCursor)) throw new Error('Invalid continuation cursor');
-      let cursor = startCursor; const cursors = new Set([cursor]); const pageSeen = new Set();
-      for (let page = 0; page < limit; page++) {
-        const data = checkResult(await this._call(command, { ...args, videoId, cursor, count: 20 }), command);
-        if (!Array.isArray(data.comments)) throw new Error(`${command} response has no comments array`);
-        let newIds = 0;
-        for (const raw of data.comments) { const cid = requirePlatformId(raw.cid, 'comment cid'); if (!pageSeen.has(cid)) { newIds++; pageSeen.add(cid); } }
-        await consume(data.comments);
-        const moreKnown = [true, false, 0, 1].includes(data.has_more);
-        if (!moreKnown) { complete = false; warnings.push(`${label}: has_more is missing or unrecognized; no safe continuation is available`); return null; }
-        if (!data.has_more) return null;
-        const next = data.cursor === 0 || data.cursor === '0' ? '0' : optionalId(data.cursor);
-        if (!next || cursors.has(next) || newIds === 0) throw Object.assign(new Error(`${label}: pagination stalled (cursor did not advance or page made no progress)`), { code: 'PAGINATION_STALLED' });
-        cursors.add(next); cursor = next;
-      }
-      complete = false; warnings.push(`${label}: page limit ${limit} reached; continue from cursor ${cursor}`);
-      return cursor;
+      const result = await this._walkPages(videoId, command, args, limit, consume, { label, startCursor,
+        nullReply: command === 'comments.replies' ? 'incomplete' : 'reject' });
+      if (result.warning) { complete = false; warnings.push(result.warning); }
+      return result.nextCursor;
     };
     const readReplies = async (rootCid, cursor = '0') => {
       id(rootCid, 'rootCid');
@@ -109,19 +147,70 @@ class DouyinAdapter {
     };
     // Resume capped threads before advancing the root list. Tree position is
     // retained across rounds, but is never treated as direct reply evidence.
-    for (const task of continuation?.replies || []) await readReplies(task.rootCid, task.cursor);
-    const startingRoot = continuation ? continuation.rootCursor : '0';
+    const resumedRoots = new Set();
+    for (const task of continuation?.replies || []) {
+      if (resumedRoots.has(task.rootCid)) continue;
+      resumedRoots.add(task.rootCid);
+      await readReplies(task.rootCid, task.cursor);
+    }
+    // An unresolved reply page must not prevent the next round from seeing
+    // newly added root comments after the root traversal has finished.
+    const startingRoot = continuation?.rootCursor ?? '0';
     let rootCursor = null;
     if (startingRoot !== null) rootCursor = await readPages('comments.list', {}, maxPages, async roots => {
       for (const root of roots) {
         const rootCid = requirePlatformId(root.cid, 'root comment cid'); add(root, null);
         if (root.reply_comment_total === 0 || root.reply_comment_total === '0') continue;
+        if (resumedRoots.has(rootCid)) continue;
         await readReplies(rootCid);
       }
     }, 'comments', startingRoot);
     if (!this.inboundSchemaConfirmed) warnings.push('Inbound reply/@ field semantics are unverified; relation-based triggers remain disabled');
     const next = rootCursor !== null || nextReplies.length ? { rootCursor, replies: nextReplies } : null;
     return { comments, complete, warnings, continuation: next };
+  }
+  async readThread(videoId, { rootCid, targetCid, targetAuthorUid, maxPages = 50, maxReplyPages = 50, signal } = {}) {
+    id(videoId, 'videoId'); id(rootCid, 'rootCid'); id(targetCid, 'targetCid'); id(targetAuthorUid, 'targetAuthorUid');
+    for (const limit of [maxPages, maxReplyPages]) if (!Number.isInteger(limit) || limit < 1 || limit > 10000) throw new Error('Pagination limits must be positive integers');
+    signal?.throwIfAborted();
+    await this.verifyVideo(videoId);
+    signal?.throwIfAborted();
+    const validateVideo = raw => {
+      if (Object.hasOwn(raw, 'aweme_id')) {
+        let actual;
+        try { actual = optionalId(raw.aweme_id); } catch { actual = null; }
+        if (actual !== videoId) throw Object.assign(new Error('评论返回的作品 ID 与指定作品不一致'), { code: 'THREAD_MISMATCH' });
+      }
+    };
+    let rawRoot = null;
+    const rootResult = await this._walkPages(videoId, 'comments.list', {}, maxPages, roots => {
+      rawRoot = roots.find(item => requirePlatformId(item.cid, 'root comment cid') === rootCid) || null;
+      if (rawRoot) { validateVideo(rawRoot); return false; }
+      return true;
+    }, { label: '根评论', signal, requireStable: true });
+    if (rootResult.warning) throw Object.assign(new Error(`根评论读取不完整：${rootResult.warning}`), { code: 'THREAD_INCOMPLETE' });
+    if (!rawRoot) throw Object.assign(new Error('在指定作品中未找到目标根评论；无法确认回复位置'), { code: 'THREAD_ROOT_NOT_FOUND' });
+    const root = normalizeComment(rawRoot, { videoId, inboundSchemaConfirmed: this.inboundSchemaConfirmed });
+    const comments = [root];
+    const replyResult = await this._walkPages(videoId, 'comments.replies', { rootCid }, maxReplyPages, replies => {
+      for (const raw of replies) {
+        validateVideo(raw);
+        if (requirePlatformId(raw.cid, 'reply cid') === rootCid) throw Object.assign(new Error('子回复列表含根评论 ID，无法确认楼层'), { code: 'THREAD_MISMATCH' });
+        // reply_id is a provisional platform field; only interpret it after
+        // the user has confirmed this exact inbound schema against live data.
+        if (this.inboundSchemaConfirmed) {
+          const parentRoot = optionalId(raw.reply_id);
+          if (parentRoot && parentRoot !== rootCid) throw Object.assign(new Error('回复返回的根评论 ID 与查询楼层不一致'), { code: 'THREAD_MISMATCH' });
+        }
+        comments.push(normalizeComment(raw, { videoId, rootCid, inboundSchemaConfirmed: this.inboundSchemaConfirmed }));
+      }
+    }, { label: '楼中回复', signal, requireStable: true,
+      nullReply: rawRoot.reply_comment_total === 0 || rawRoot.reply_comment_total === '0' ? 'known-empty' : 'reject' });
+    if (replyResult.warning) throw Object.assign(new Error(`楼中回复读取不完整：${replyResult.warning}`), { code: 'THREAD_INCOMPLETE' });
+    const target = comments.find(comment => comment.cid === targetCid);
+    if (!target) throw Object.assign(new Error('完整楼层中未找到目标评论；无法继续回复'), { code: 'THREAD_TARGET_NOT_FOUND' });
+    if (!target.authorUid || target.authorUid !== targetAuthorUid) throw Object.assign(new Error('目标评论作者与先前记录不一致；无法继续回复'), { code: 'THREAD_TARGET_MISMATCH' });
+    return { complete: true, root, target, comments };
   }
   async uploadImage(filePath) {
     if (typeof filePath !== 'string' || !filePath) throw new Error('Image path is required');
@@ -148,17 +237,20 @@ class DouyinAdapter {
       return { uri: image.uri, width: image.width, height: image.height, format: image.format || formats[ext] };
     } catch (error) { try { await this._call('images.reset', { uploadId }); } catch {} throw error; }
   }
-  async publishReply({ videoId, targetCid, rootCid = null, text, images = [] }) {
+  async publishReply({ videoId, targetCid, rootCid = null, text, images = [], signal }) {
     let publishStarted = false;
     let receiptCid;
     try {
+      signal?.throwIfAborted();
       id(videoId, 'videoId'); id(targetCid, 'targetCid'); if (rootCid != null) id(rootCid, 'rootCid');
-      if (typeof text !== 'string' || !text.trim()) throw new Error('Reply text is required');
       if (!Array.isArray(images) || images.length > 9) throw new Error('At most nine reply images are allowed');
+      if (typeof text !== 'string' || (!text.trim() && images.length === 0)) throw new Error('Reply text or an image is required');
       await this.verifyVideo(videoId);
+      signal?.throwIfAborted();
       const uploaded = [];
       for (const image of images) uploaded.push(typeof image === 'string' ? await this.uploadImage(image) : image);
       await this.verifyVideo(videoId);
+      signal?.throwIfAborted();
       // Validate before crossing the comment-send boundary, including any image
       // metadata produced by upload. An invalid local payload was never published.
       validateCommand('comments.publish', { accountUid: this.accountUid, videoId, targetCid, rootCid, text, images: uploaded });

@@ -9,6 +9,69 @@ const { Worker } = require('../src/worker');
 const { acquireLock } = require('../src/lock');
 const { DouyinAdapter, normalizeComment } = require('../src/douyin/adapter');
 
+test('启用直接呼唤后重新评估曾跳过的评论，不调用问句判断且成功后不重发', async t => {
+  const observed = [];
+  const { worker, config, agent, sent, store } = setup(t, [comment(40001, { text: '大肥鱼！', mentionUids: [], mentionsKnown: false })], { log: e => observed.push(e) });
+  config.douyin.inboundSchemaConfirmed = false;
+  config.triggers = { respondToNameCall: false };
+  let decisions = 0;
+  agent.decideAddressed = async () => { decisions++; return { addressed: false, reason: '只呼唤角色名' }; };
+  assert.equal((await worker.runOnce()).skipped, 1);
+  config.triggers.respondToNameCall = true;
+  assert.equal((await worker.runOnce()).sent, 1);
+  assert.equal(decisions, 1); assert.equal(sent.length, 1);
+  assert.equal(store.get(`${ME}:${VIDEO}:40001`).status, 'succeeded');
+  assert.equal((await worker.runOnce()).attempted, 0);
+  assert.ok(observed.some(e => e.event === 'comment.skipped' && e.message === '只呼唤角色名'));
+  assert.ok(observed.some(e => e.event === 'comment.succeeded' && e.data.commentText === '大肥鱼！'));
+});
+
+test('新增呼唤规则不会重新打开已经发送或待核查的相同目标', async t => {
+  const { worker, config, store, sent } = setup(t, [comment(40001, { text: '大肥鱼', mentionUids: [] })]);
+  const item = comment(40001, { text: '大肥鱼', mentionUids: [] });
+  const key = store.enqueue(ME, item, { eligible: false, needsSemantic: true });
+  store.finish(key, 'unknown', { reason: '历史回执未完整核验', result: { cid: '90001' } });
+  config.triggers = { respondToNameCall: true };
+  assert.equal((await worker.runOnce()).attempted, 0); assert.equal(sent.length, 0);
+  assert.equal(store.get(key).status, 'unknown');
+});
+
+test('停止语义判断后不再生成回复，尚未发送的任务回到pending', async t => {
+  const controller = new AbortController(); let generations = 0;
+  const { worker, agent, store, sent } = setup(t, [comment(40001, { mentionUids: [], mentionsKnown: false })]);
+  agent.decideAddressed = async () => { controller.abort(); return { addressed: true, reason: '向鱼提问' }; };
+  agent.generate = async () => { generations++; return { text: '鱼来啦' }; };
+  await assert.rejects(worker.runOnce({ signal: controller.signal }), { name: 'AbortError' });
+  assert.equal(generations, 0); assert.equal(sent.length, 0);
+  assert.equal(store.get(`${ME}:${VIDEO}:40001`).status, 'pending');
+});
+
+test('停止生成或表情检索后不进入新的付费与发送阶段', async t => {
+  for (const phase of ['generation', 'search', 'choose', 'file', 'upload']) {
+    const controller = new AbortController();
+    const { worker, agent, config, store, sent, adapter } = setup(t, [comment(40001)]);
+    config.stickers.enabled = true;
+    const calls = [];
+    agent.generate = async () => { calls.push('generation'); if (phase === 'generation') controller.abort(); return { text: '鱼来啦', stickerQuery: '开心' }; };
+    worker.stickers = { search: async () => { calls.push('search'); if (phase === 'search') controller.abort(); return [{ id: 'fish' }]; },
+      file: async () => { calls.push('file'); if (phase === 'file') controller.abort(); return { path: '/fake.gif', mime: 'image/gif' }; } };
+    agent.chooseSticker = async () => { calls.push('choose'); if (phase === 'choose') controller.abort(); return 'fish'; };
+    adapter.uploadImage = async () => { calls.push('upload'); controller.abort(); return { uri: 'tos/fake', format: 'gif', width: 1, height: 1 }; };
+    await assert.rejects(worker.runOnce({ signal: controller.signal }), { name: 'AbortError' });
+    assert.equal(sent.length, 0); assert.equal(calls.at(-1), phase);
+    assert.equal(store.get(`${ME}:${VIDEO}:40001`).status, 'pending');
+  }
+});
+
+test('停止到达已发请求时仍保存成功回执，之后同一目标不重发', async t => {
+  const controller = new AbortController();
+  const { worker, adapter, store, sent } = setup(t, [comment(40001)]);
+  adapter.publishReply = async r => { sent.push(r); controller.abort(); return { cid: '90001', targetVerified: true, imageCount: 0 }; };
+  await assert.rejects(worker.runOnce({ signal: controller.signal }), { name: 'AbortError' });
+  assert.equal(store.get(`${ME}:${VIDEO}:40001`).status, 'succeeded');
+  assert.equal((await worker.runOnce()).attempted, 0); assert.equal(sent.length, 1);
+});
+
 const ME = '10001', VIDEO = '20001';
 function comment(cid, extra = {}) {
   return { videoId: VIDEO, cid: String(cid), authorUid: '30001', text: `大肥鱼你在吗${cid}`, rootCid: String(cid), mentionUids: [ME], mentionsKnown: true, replyRelationKnown: false, createdAt: Number(cid), ...extra };
@@ -25,10 +88,19 @@ function setup(t, events, overrides = {}) {
   const adapter = {
     async verifyVideo() {},
     async scanVideo() { return { comments: events, complete: true, warnings: [] }; },
+    async readThread(_video, { targetCid, rootCid }) {
+      const target = events.find(c => c.cid === targetCid) || store.getComment(ME, VIDEO, targetCid);
+      if (!target) throw new Error('目标评论不存在');
+      const comments = events.filter(c => (c.rootCid || c.cid) === rootCid);
+      if (!comments.some(c => c.cid === targetCid)) comments.push(target);
+      return { complete: true, target, comments };
+    },
     async publishReply(reply) { sent.push(reply); return { cid: String(90000 + sent.length), imageCount: reply.images.length, targetVerified: true }; },
     async uploadImage() { return { uri: 'uploaded', width: 10, height: 10, format: 'gif' }; },
   };
   const agent = {
+    async reviewInput() { return { safe: true, reason: '安全' }; },
+    async reviewOutput() { return { safe: true, reason: '安全' }; },
     async decideAddressed() { return { addressed: true, reason: '正在问大肥鱼' }; },
     async generate(c) { return { text: `鱼收到${c.cid}啦` }; },
     async chooseSticker() { return null; },
@@ -36,6 +108,72 @@ function setup(t, events, overrides = {}) {
   const worker = new Worker({ config, store, adapter, agent, sleep: async ms => { waits.push(ms); }, ...overrides });
   return { worker, store, config, adapter, agent, sent, waits, directory, filename };
 }
+
+test('实时完整楼层的根评论和所有兄弟回复提供给审核与生成，保留各自身份', async t => {
+  const root = comment(40001, { text: '根楼', authorUid: ME, mentionUids: [] });
+  const sibling = comment(40002, { rootCid: root.cid, text: '一条回复', mentionUids: [] });
+  const target = comment(40003, { rootCid: root.cid, text: '大肥鱼来看看', mentionUids: [ME] });
+  const { worker, agent, sent, config } = setup(t, [root, sibling, target]);
+  config.worker.maxCandidatesPerRound = 3;
+  let observed;
+  agent.reviewInput = async (c, context) => { if (c.cid === target.cid) observed = context; return { safe: true }; };
+  await worker.runOnce();
+  assert.ok(sent.some(r => r.targetCid === target.cid));
+  assert.deepEqual(observed.thread.map(c => c.cid), [root.cid, sibling.cid]);
+  assert.deepEqual(observed.thread.map(c => c.isOwn), [true, false]);
+  assert.equal(observed.thread.some(c => c.cid === target.cid), false);
+});
+
+test('楼层读取失败或目标内容变化时不调用模型也不发送', async t => {
+  for (const mode of ['failure', 'incomplete', 'changed']) {
+    const { worker, adapter, agent, sent } = setup(t, [comment(40001)]);
+    let modelCalls = 0;
+    agent.reviewInput = async () => { modelCalls++; return { safe: true }; };
+    adapter.readThread = async () => {
+      if (mode === 'failure') throw new Error('不完整的楼层');
+      const target = comment(40001, mode === 'changed' ? { text: '已改变' } : {});
+      return { complete: mode !== 'incomplete', target, comments: [target] };
+    };
+    assert.equal((await worker.runOnce()).failed, 1);
+    assert.equal(modelCalls, 0); assert.equal(sent.length, 0);
+  }
+});
+
+test('输入或输出安全审核不通过、格式错误或异常时绝不发送', async t => {
+  for (const phase of ['reviewInput', 'reviewOutput']) {
+    for (const mode of ['reject', 'invalid', 'error']) {
+      const { worker, agent, sent, store } = setup(t, [comment(40001)]);
+      agent[phase] = async () => {
+        if (mode === 'error') throw new Error('审核不可用');
+        return mode === 'reject' ? { safe: false, reason: '提示词注入' } : {};
+      };
+      const summary = await worker.runOnce();
+      assert.equal(sent.length, 0);
+      assert.equal(summary.attempted, 0);
+      assert.equal(summary[mode === 'error' ? 'failed' : 'skipped'], 1);
+      assert.notEqual(store.get(`${ME}:${VIDEO}:40001`).status, 'succeeded');
+    }
+  }
+});
+
+test('启用表情时纯图可发送；无匹配素材时不发送空评论', async t => {
+  for (const available of [true, false]) {
+    const { worker, config, agent, sent } = setup(t, [comment(40001)]);
+    config.stickers.enabled = true;
+    agent.generate = async (_comment, context) => {
+      assert.equal(context.allowImageOnly, true);
+      return { text: '', stickerQuery: '打招呼' };
+    };
+    worker.stickers = { search: async () => available ? [{ id: '鱼' }] : [],
+      file: async () => ({ path: '/fake/fish.gif', mime: 'image/gif' }) };
+    agent.chooseSticker = async candidates => candidates[0]?.id || null;
+    const summary = await worker.runOnce();
+    assert.equal(summary.sent, available ? 1 : 0);
+    assert.equal(sent.length, available ? 1 : 0);
+    if (available) { assert.equal(sent[0].text, ''); assert.equal(sent[0].images.length, 1); }
+    else assert.equal(summary.skipped, 1);
+  }
+});
 
 test('历史评论分轮限量，同一目标不重复；新回复继续处理', async t => {
   const events = [1, 2, 3, 4, 5].map(n => comment(40000 + n));
@@ -322,6 +460,7 @@ test('发布前真实适配器身份拒绝时尚未调用publish，应failed并�
     if (command === 'comments.list') return { status_code: 0, has_more: 0, comments: [
       { cid: '40001', user: { uid: '30001' }, text: '哈哈', text_extra: [{ type: 0, user_id: ME }], reply_comment_total: 0 },
     ] };
+    if (command === 'comments.replies') return { status_code: 0, has_more: 0, comments: [], _bridge_reply_query: 'item_id-v1' };
     if (command === 'comments.publish') { publishCalls++; return { status_code: 0, comment: { cid: '90001', user: { uid: ME }, aweme_id: VIDEO, reply_id: '40001', reply_to_reply_id: '0', image_list: [] } }; }
     throw new Error('unexpected command');
   } };
@@ -334,8 +473,7 @@ test('发布前真实适配器身份拒绝时尚未调用publish，应failed并�
   changed = false;
   agent.generate = async () => ({ text: '鱼先来啦' });
   // Same condition used by the CLI's explicitly authorized retry command.
-  const requeued = store.db.prepare("UPDATE jobs SET status='pending' WHERE job_key=? AND account_uid=? AND status='failed'").run(key, ME);
-  assert.equal(requeued.changes, 1);
+  store.retryFailed(key, ME);
   assert.equal((await worker.runOnce()).sent, 1);
   assert.equal(publishCalls, 1);
 });
